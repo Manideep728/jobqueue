@@ -1,0 +1,6 @@
+bin/
+*.exe
+.env
+.env.*
+.DS_Store
+coverage.out
