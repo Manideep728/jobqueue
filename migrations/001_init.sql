@@ -27,3 +27,31 @@ CREATE TABLE IF NOT EXISTS jobs (
     result_exit_code INTEGER,
     duration_ms      BIGINT
 );
+
+-- The claim query's exact predicate. A partial index keeps the index small: it
+-- only contains rows that are actually claimable candidates, so the queue does
+-- not slow down as millions of COMPLETED rows pile up.
+CREATE INDEX IF NOT EXISTS idx_jobs_claimable
+    ON jobs (available_at, id) WHERE status = 'PENDING';
+
+-- The lease reaper's predicate, same reasoning.
+CREATE INDEX IF NOT EXISTS idx_jobs_expired_leases
+    ON jobs (lease_until) WHERE status = 'RUNNING';
+
+-- Supports GET /jobs and GET /jobs?status=...
+CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs (status, id DESC);
+
+-- Supports "what has this worker been doing".
+CREATE INDEX IF NOT EXISTS idx_jobs_worker ON jobs (worker_id) WHERE worker_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS workers (
+    id             TEXT        PRIMARY KEY,
+    hostname       TEXT        NOT NULL DEFAULT '',
+    registered_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT now(),
+    jobs_processed BIGINT      NOT NULL DEFAULT 0,
+    current_job_id BIGINT      REFERENCES jobs(id) ON DELETE SET NULL
+);
+
+-- Supports "which workers are still alive".
+CREATE INDEX IF NOT EXISTS idx_workers_heartbeat ON workers (last_heartbeat);
