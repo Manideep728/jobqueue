@@ -209,3 +209,175 @@ func (s *Store) explainLostRow(ctx context.Context, id int64) error {
 	}
 	return ErrNotOwned
 }
+
+
+
+
+
+
+type Result struct {
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	ExitCode   *int   `json:"exit_code"`
+	DurationMS *int64 `json:"duration_ms"`
+	Error      string `json:"error"`
+}
+
+
+const MaxResultBytes = 32 * 1024
+
+
+
+func TruncateOutput(s string) string {
+	if len(s) <= MaxResultBytes {
+		return s
+	}
+	return s[:MaxResultBytes] + "\n...[truncated]"
+}
+
+
+
+
+
+
+
+
+
+
+
+func (s *Store) Complete(ctx context.Context, id int64, workerID string, res Result) (*Job, error) {
+	const q = `UPDATE jobs SET
+			status = 'COMPLETED', worker_id = $2, lease_until = NULL, updated_at = now(),
+			result_stdout = $3, result_stderr = $4, result_exit_code = $5,
+			duration_ms = $6, last_error = NULL
+		WHERE id = $1 AND status = 'RUNNING' AND worker_id = $2
+		RETURNING ` + jobCols
+	return s.finish(ctx, q, id, workerID, res, StatusCompleted)
+}
+
+
+
+
+func (s *Store) finish(ctx context.Context, q string, id int64, workerID string, res Result, want Status) (*Job, error) {
+	var job *Job
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		j, err := scanJob(tx.QueryRowContext(ctx, q, id, workerID,
+			TruncateOutput(res.Stdout), TruncateOutput(res.Stderr), res.ExitCode, res.DurationMS))
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoJobs 
+		}
+		if err != nil {
+			return err
+		}
+		
+		
+		
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE workers SET jobs_processed = jobs_processed + 1, current_job_id = NULL,
+				last_heartbeat = now() WHERE id = $1`, workerID); err != nil {
+			return err
+		}
+		job = j
+		return nil
+	})
+	if errors.Is(err, ErrNoJobs) {
+		return s.replayOrConflict(ctx, id, workerID, want)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+
+func (s *Store) replayOrConflict(ctx context.Context, id int64, workerID string, want Status) (*Job, error) {
+	cur, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err 
+	}
+	
+	if cur.Status == want && cur.WorkerID != nil && *cur.WorkerID == workerID {
+		return cur, nil
+	}
+	
+	
+	if want == StatusFailed && cur.Status == StatusPending && cur.WorkerID == nil {
+		return cur, nil
+	}
+	return nil, ErrNotOwned
+}
+
+
+
+
+
+func (s *Store) Fail(ctx context.Context, id int64, workerID string, res Result) (*Job, error) {
+	
+	
+	
+	cur, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	delay := s.backoff.Delay(cur.Attempts)
+
+	const q = `UPDATE jobs SET
+			status = CASE WHEN attempts >= max_attempts THEN 'FAILED' ELSE 'PENDING' END,
+			-- a job going back to PENDING must release its worker, or the next
+			-- claim would hand it out with a stale owner attached
+			worker_id = CASE WHEN attempts >= max_attempts THEN $2 ELSE NULL END,
+			lease_until = NULL,
+			available_at = now() + make_interval(secs => $7),
+			updated_at = now(),
+			last_error = $8,
+			result_stdout = $3, result_stderr = $4, result_exit_code = $5, duration_ms = $6
+		WHERE id = $1 AND status = 'RUNNING' AND worker_id = $2
+		RETURNING ` + jobCols
+
+	var job *Job
+	txErr := s.withTx(ctx, func(tx *sql.Tx) error {
+		j, err := scanJob(tx.QueryRowContext(ctx, q, id, workerID,
+			TruncateOutput(res.Stdout), TruncateOutput(res.Stderr), res.ExitCode,
+			res.DurationMS, delay.Seconds(), TruncateOutput(res.Error)))
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoJobs
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE workers SET jobs_processed = jobs_processed + 1, current_job_id = NULL,
+				last_heartbeat = now() WHERE id = $1`, workerID); err != nil {
+			return err
+		}
+		job = j
+		return nil
+	})
+	if errors.Is(txErr, ErrNoJobs) {
+		return s.replayOrConflict(ctx, id, workerID, StatusFailed)
+	}
+	if txErr != nil {
+		return nil, txErr
+	}
+	return job, nil
+}
+
+
+
+
+func (s *Store) Cancel(ctx context.Context, id int64) (*Job, error) {
+	const q = `UPDATE jobs SET status = 'CANCELED', updated_at = now(), lease_until = NULL
+		WHERE id = $1 AND status = 'PENDING' RETURNING ` + jobCols
+	j, err := scanJob(s.db.QueryRowContext(ctx, q, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		cur, gerr := s.Get(ctx, id)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if cur.Status == StatusCanceled {
+			return cur, nil 
+		}
+		return nil, ErrNotCancelable
+	}
+	return j, err
+}
