@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 
@@ -113,4 +114,75 @@ func (s *Store) List(ctx context.Context, status Status, limit, offset int) ([]*
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+func (s *Store) Claim(ctx context.Context, workerID string, lease time.Duration) (*Job, error) {
+	const q = `
+		UPDATE jobs SET
+			status       = 'RUNNING',
+			worker_id    = $1,
+			lease_until  = now() + make_interval(secs => $2),
+			attempts     = attempts + 1,
+			updated_at   = now()
+		WHERE id = (
+			SELECT id FROM jobs
+			WHERE status = 'PENDING' AND available_at <= now()
+			ORDER BY available_at, id
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING ` + jobCols
+
+	var job *Job
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		j, err := scanJob(tx.QueryRowContext(ctx, q, workerID, lease.Seconds()))
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNoJobs 
+		}
+		if err != nil {
+			return err
+		}
+		
+		
+		
+		
+		
+		res, err := tx.ExecContext(ctx,
+			`UPDATE workers SET current_job_id = $1, last_heartbeat = now() WHERE id = $2`,
+			j.ID, workerID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrUnknownWorker
+		}
+		job = j
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
 }
