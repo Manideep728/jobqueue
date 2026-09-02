@@ -186,3 +186,26 @@ func (s *Store) Claim(ctx context.Context, workerID string, lease time.Duration)
 	}
 	return job, nil
 }
+
+
+
+
+func (s *Store) RenewLease(ctx context.Context, id int64, workerID string, lease time.Duration) (*Job, error) {
+	const q = `UPDATE jobs SET lease_until = now() + make_interval(secs => $3), updated_at = now()
+		WHERE id = $1 AND status = 'RUNNING' AND worker_id = $2
+		RETURNING ` + jobCols
+	j, err := scanJob(s.db.QueryRowContext(ctx, q, id, workerID, lease.Seconds()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, s.explainLostRow(ctx, id)
+	}
+	return j, err
+}
+
+
+
+func (s *Store) explainLostRow(ctx context.Context, id int64) error {
+	if _, err := s.Get(ctx, id); err != nil {
+		return err 
+	}
+	return ErrNotOwned
+}
