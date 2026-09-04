@@ -381,3 +381,94 @@ func (s *Store) Cancel(ctx context.Context, id int64) (*Job, error) {
 	}
 	return j, err
 }
+
+
+
+
+
+
+type Reaped struct {
+	ID       int64
+	Attempts int
+	Status   Status 
+	Worker   string
+}
+
+
+
+
+
+
+
+
+
+
+func (s *Store) ReapExpiredLeases(ctx context.Context, batch int) ([]Reaped, error) {
+	if batch <= 0 {
+		batch = 100
+	}
+	var out []Reaped
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, attempts, max_attempts, coalesce(worker_id, '')
+			FROM jobs WHERE status = 'RUNNING' AND lease_until < now()
+			ORDER BY lease_until
+			FOR UPDATE SKIP LOCKED LIMIT $1`, batch)
+		if err != nil {
+			return err
+		}
+		type expired struct {
+			id                 int64
+			attempts, maxAttem int
+			worker             string
+		}
+		var found []expired
+		for rows.Next() {
+			var e expired
+			if err := rows.Scan(&e.id, &e.attempts, &e.maxAttem, &e.worker); err != nil {
+				rows.Close()
+				return err
+			}
+			found = append(found, e)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		
+		
+		rows.Close()
+
+		for _, e := range found {
+			next := StatusPending
+			if e.attempts >= e.maxAttem {
+				next = StatusFailed
+			}
+			delay := s.backoff.Delay(e.attempts)
+			
+			
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE jobs SET status = $2,
+					worker_id = CASE WHEN $2 = 'FAILED' THEN worker_id ELSE NULL END,
+					lease_until = NULL,
+					available_at = now() + make_interval(secs => $3),
+					last_error = $4, updated_at = now()
+				WHERE id = $1 AND status = 'RUNNING'`,
+				e.id, string(next), delay.Seconds(),
+				fmt.Sprintf("lease expired (worker %s stopped reporting)", e.worker)); err != nil {
+				return err
+			}
+			
+			if e.worker != "" {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE workers SET current_job_id = NULL WHERE id = $1 AND current_job_id = $2`,
+					e.worker, e.id); err != nil {
+					return err
+				}
+			}
+			out = append(out, Reaped{ID: e.id, Attempts: e.attempts, Status: next, Worker: e.worker})
+		}
+		return nil
+	})
+	return out, err
+}
