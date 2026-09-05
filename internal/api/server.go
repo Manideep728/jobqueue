@@ -12,28 +12,29 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
 	"github.com/manideep7286/queue/internal/jobs"
 )
 
-
+// Config holds the server's tunables.
 type Config struct {
-	
-	
+	// DefaultLease is how long a claimed job is reserved for its worker when the
+	// worker does not ask for a specific duration.
 	DefaultLease time.Duration
-	
-	
+	// MinLease/MaxLease clamp what a worker may request. A client-chosen lease of
+	// 24 hours would make a crashed worker's job unrecoverable for a day.
 	MinLease time.Duration
 	MaxLease time.Duration
-	
-	
+	// HeartbeatTimeout is how long since the last heartbeat before a worker is
+	// reported as not alive.
 	HeartbeatTimeout time.Duration
-	
+	// AuthToken, when non-empty, is required as `Authorization: Bearer <token>`.
 	AuthToken string
-	
+	// MaxRequestBytes caps request body size.
 	MaxRequestBytes int64
 }
 
-
+// DefaultConfig returns sensible values for local use.
 func DefaultConfig() Config {
 	return Config{
 		DefaultLease:     30 * time.Second,
@@ -44,35 +45,35 @@ func DefaultConfig() Config {
 	}
 }
 
-
+// Server wires the store to an http.Handler.
 type Server struct {
 	store *jobs.Store
 	cfg   Config
 	mux   *http.ServeMux
 }
 
-
+// New builds the router and returns a ready Server.
 func New(store *jobs.Store, cfg Config) *Server {
 	s := &Server{store: store, cfg: cfg, mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
 
-
-
-
-
-
-
+// routes registers every endpoint.
+//
+// The "METHOD /path/{wildcard}" pattern syntax is Go 1.22+ net/http. It gives
+// method matching and path parameters from the standard library, which is why
+// this project needs no router dependency. A request to a known path with the
+// wrong method now yields 405 automatically rather than 404.
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /stats", s.handleStats)
 
 	s.mux.HandleFunc("POST /jobs", s.handleCreateJob)
 	s.mux.HandleFunc("GET /jobs", s.handleListJobs)
-	
-	
-	
+	// Registered before the {id} patterns in source order, though the mux
+	// resolves by specificity, not order: "/jobs/claim" is a literal segment and
+	// therefore always beats a wildcard.
 	s.mux.HandleFunc("POST /jobs/claim", s.handleClaim)
 	s.mux.HandleFunc("GET /jobs/{id}", s.handleGetJob)
 	s.mux.HandleFunc("POST /jobs/{id}/cancel", s.handleCancel)
@@ -85,10 +86,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /workers/{id}/heartbeat", s.handleHeartbeat)
 }
 
-
-
+// ServeHTTP applies the middleware chain. Outermost first: recovery must wrap
+// logging so that a panic is still logged as a completed request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var h http.Handler = s.mux
+	h = jsonErrors(h)
 	h = auth(s.cfg.AuthToken, h)
 	h = maxBody(s.cfg.MaxRequestBytes, h)
 	h = logging(h)
@@ -96,15 +98,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(w, r)
 }
 
+// ---------------------------------------------------------------------------
+// Request helpers
+// ---------------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
+// decode reads a JSON body into dst, returning a message suitable for a 400.
+//
+// DisallowUnknownFields makes a misspelled field ("max_attempt") an explicit
+// error instead of a silently-ignored one that leaves the caller wondering why
+// their setting had no effect.
 func decode(r *http.Request, dst any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -118,15 +120,15 @@ func decode(r *http.Request, dst any) error {
 		}
 		return errors.New("malformed JSON: " + err.Error())
 	}
-	
-	
+	// Reject trailing content, so `{"a":1}{"b":2}` is not read as just the first
+	// object -- silently dropping half a request is worse than rejecting it.
 	if dec.More() {
 		return errors.New("unexpected trailing content after JSON object")
 	}
 	return nil
 }
 
-
+// pathID parses the {id} wildcard.
 func pathID(r *http.Request) (int64, error) {
 	raw := r.PathValue("id")
 	id, err := strconv.ParseInt(raw, 10, 64)
@@ -136,7 +138,7 @@ func pathID(r *http.Request) (int64, error) {
 	return id, nil
 }
 
-
+// clampLease keeps a worker-requested lease inside the configured bounds.
 func (s *Server) clampLease(seconds float64) time.Duration {
 	if seconds <= 0 {
 		return s.cfg.DefaultLease
@@ -151,13 +153,13 @@ func (s *Server) clampLease(seconds float64) time.Duration {
 	return d
 }
 
-
-
-
+// ---------------------------------------------------------------------------
+// Health and stats
+// ---------------------------------------------------------------------------
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	
-	
+	// A health check that does not touch the database is close to useless: the
+	// process can be perfectly alive while unable to serve a single request.
 	if _, err := s.store.Stats(r.Context()); err != nil {
 		slog.Error("health check failed", "error", err)
 		writeError(w, http.StatusServiceUnavailable, CodeInternal, "database unavailable")
@@ -190,9 +192,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-
-
-
+// ---------------------------------------------------------------------------
+// Job endpoints
+// ---------------------------------------------------------------------------
 
 type createJobRequest struct {
 	Type        string `json:"type"`
@@ -207,7 +209,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.MaxAttempts == 0 {
-		req.MaxAttempts = 3 
+		req.MaxAttempts = 3 // omitted means "use the default", not "zero attempts"
 	}
 	req.Type = strings.TrimSpace(req.Type)
 	if err := jobs.ValidateNew(req.Type, req.Payload, req.MaxAttempts); err != nil {
@@ -225,8 +227,8 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	
-	
+	// Statuses are stored uppercase; accepting ?status=pending is a kindness to
+	// anyone typing the URL by hand.
 	status := jobs.Status(strings.ToUpper(strings.TrimSpace(q.Get("status"))))
 	if status != "" && !jobs.ValidStatus(status) {
 		writeError(w, http.StatusBadRequest, CodeBadRequest,
@@ -313,7 +315,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	lease := s.clampLease(req.LeaseSeconds)
 	job, err := s.store.Claim(r.Context(), req.WorkerID, lease)
 	if err != nil {
-		writeStoreError(w, err) 
+		writeStoreError(w, err) // ErrNoJobs becomes 404 + code no_jobs_available
 		return
 	}
 	slog.Info("job_claimed", "job_id", job.ID, "worker_id", req.WorkerID,
@@ -321,7 +323,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
-
+// reportRequest is the body for complete, fail and lease renewal.
 type reportRequest struct {
 	WorkerID     string  `json:"worker_id"`
 	Stdout       string  `json:"stdout"`
@@ -332,7 +334,7 @@ type reportRequest struct {
 	LeaseSeconds float64 `json:"lease_seconds"`
 }
 
-
+// parseReport does the validation shared by the three worker-report endpoints.
 func (s *Server) parseReport(w http.ResponseWriter, r *http.Request) (int64, reportRequest, bool) {
 	id, err := pathID(r)
 	if err != nil {
@@ -385,7 +387,7 @@ func (s *Server) handleFail(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	
+	// Two distinct events: a retry is routine, retry exhaustion is not.
 	if job.Status == jobs.StatusPending {
 		slog.Warn("job_retrying", "job_id", job.ID, "worker_id", req.WorkerID,
 			"attempts", job.Attempts, "max_attempts", job.MaxAttempts,
@@ -412,9 +414,9 @@ func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
-
-
-
+// ---------------------------------------------------------------------------
+// Worker endpoints
+// ---------------------------------------------------------------------------
 
 type registerRequest struct {
 	WorkerID string `json:"worker_id"`
@@ -450,8 +452,8 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	worker, err := s.store.Heartbeat(r.Context(), id)
 	if errors.Is(err, jobs.ErrNotFound) {
-		
-		
+		// A specific 404 so the worker knows to re-register rather than retrying
+		// heartbeats forever against a database that was reset underneath it.
 		writeError(w, http.StatusNotFound, CodeNotFound, "unknown worker: register first")
 		return
 	}
