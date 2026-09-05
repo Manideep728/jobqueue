@@ -80,6 +80,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /jobs/{id}/fail", s.handleFail)
 	s.mux.HandleFunc("POST /jobs/{id}/lease", s.handleRenewLease)
 
+	s.mux.HandleFunc("POST /workers/register", s.handleRegisterWorker)
+	s.mux.HandleFunc("GET /workers", s.handleListWorkers)
+	s.mux.HandleFunc("POST /workers/{id}/heartbeat", s.handleHeartbeat)
 }
 
 
@@ -169,7 +172,22 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": stats})
+	workers, err := s.store.ListWorkers(r.Context(), s.cfg.HeartbeatTimeout)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	alive := 0
+	for _, wk := range workers {
+		if wk.Alive {
+			alive++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"jobs":          stats,
+		"workers_total": len(workers),
+		"workers_alive": alive,
+	})
 }
 
 
@@ -392,4 +410,63 @@ func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("lease_renewed", "job_id", job.ID, "worker_id", req.WorkerID)
 	writeJSON(w, http.StatusOK, job)
+}
+
+
+
+
+
+type registerRequest struct {
+	WorkerID string `json:"worker_id"`
+	Hostname string `json:"hostname"`
+}
+
+func (s *Server) handleRegisterWorker(w http.ResponseWriter, r *http.Request) {
+	var req registerRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, err.Error())
+		return
+	}
+	req.WorkerID = strings.TrimSpace(req.WorkerID)
+	if req.WorkerID == "" || len(req.WorkerID) > 128 {
+		writeError(w, http.StatusBadRequest, CodeBadRequest,
+			"worker_id is required and must be at most 128 characters")
+		return
+	}
+	worker, err := s.store.RegisterWorker(r.Context(), req.WorkerID, req.Hostname)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	slog.Info("worker_registered", "worker_id", worker.ID, "hostname", worker.Hostname)
+	writeJSON(w, http.StatusCreated, worker)
+}
+
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "worker id is required")
+		return
+	}
+	worker, err := s.store.Heartbeat(r.Context(), id)
+	if errors.Is(err, jobs.ErrNotFound) {
+		
+		
+		writeError(w, http.StatusNotFound, CodeNotFound, "unknown worker: register first")
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, worker)
+}
+
+func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListWorkers(r.Context(), s.cfg.HeartbeatTimeout)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workers": list, "count": len(list)})
 }
