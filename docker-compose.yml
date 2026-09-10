@@ -1,0 +1,80 @@
+# `docker compose up` starts Postgres, the queue server, and two workers.
+#
+# SECURITY: the server executes shell commands submitted through its API. The
+# published port below binds to 127.0.0.1 explicitly, so the queue is reachable
+# from this machine only. Removing that prefix exposes remote code execution to
+# your whole network -- do not do it.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queue
+      POSTGRES_PASSWORD: queue
+      POSTGRES_DB: queue
+    ports:
+      # Exposed for `go test ./tests/` and psql from the host.
+      #
+      # The host port defaults to 5433, not 5432: a developer machine very often
+      # already runs Postgres on 5432, and a port clash is a confusing first
+      # experience. Override with QUEUE_PG_PORT if you want a different one.
+      - "127.0.0.1:${QUEUE_PG_PORT:-5433}:5432"
+    volumes:
+      # A named volume keeps jobs across `docker compose down`, which is what
+      # makes the "jobs survive a restart" demo meaningful.
+      - queue-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The server retries on its own, but a healthcheck lets compose start
+      # things in a sensible order and makes a broken database obvious.
+      test: ["CMD-SHELL", "pg_isready -U queue -d queue"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  server:
+    build: .
+    command: ["queue-server"]
+    environment:
+      DATABASE_URL: postgres://queue:queue@postgres:5432/queue?sslmode=disable
+      # Inside the container the server must listen on all interfaces for the
+      # port publishing below to reach it; the host-side binding is what keeps
+      # it private.
+      QUEUE_ADDR: 0.0.0.0:8080
+      QUEUE_LEASE_SECONDS: "30"
+      QUEUE_REAP_SECONDS: "5"
+      QUEUE_LOG_FORMAT: json
+      # Uncomment to require a bearer token on every request:
+      # QUEUE_AUTH_TOKEN: change-me
+    ports:
+      - "127.0.0.1:${QUEUE_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Two workers by default. Scale with:  docker compose up --scale worker=5
+  # No fixed worker id is set, so each container generates its own.
+  worker:
+    build: .
+    command: ["queue-worker"]
+    environment:
+      QUEUE_SERVER: http://server:8080
+      QUEUE_LEASE_SECONDS: "30"
+      QUEUE_POLL_SECONDS: "1"
+      QUEUE_JOB_TIMEOUT_SECONDS: "300"
+      QUEUE_LOG_FORMAT: json
+      # QUEUE_AUTH_TOKEN: change-me
+    depends_on:
+      server:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+volumes:
+  queue-pgdata:
