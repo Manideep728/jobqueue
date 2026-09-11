@@ -152,35 +152,62 @@ Leases, heartbeats, retry scheduling, the state machine and the full API are in
 
 ## Benchmarks
 
-Measured on an M-series laptop, all services in Docker Desktop, 5 workers,
-300 no-op jobs (`true`):
+The harness that produced these numbers is in the repo
+([cmd/queue-bench](cmd/queue-bench/main.go)) -- it drives the real stack over
+HTTP and prints the table below:
+
+```bash
+docker compose up -d --scale worker=5
+make bench          # go run ./cmd/queue-bench --jobs 300 --concurrency 16
+```
+
+Measured on a MacBook Air (M1, 8 cores) with Docker Desktop allotted 4 CPUs and
+2 GB: Postgres, the server and 5 workers all in containers, 300 no-op jobs
+(`true`). Each figure is the range across 3 consecutive runs.
 
 | Metric | Result |
 |---|---|
-| Submit throughput | 380 jobs/s (`POST /jobs`, 16 concurrent connections) |
-| End-to-end throughput | 228 jobs/s (submit → execute → report) |
-| Job execution time | ~10 ms (process spawn dominates) |
-| Single-job latency, idle pool | 35–680 ms |
+| Submit throughput (16 connections) | 1,320-1,480 jobs/s |
+| End-to-end throughput (submit, claim, execute, report) | 315-350 jobs/s |
+| Job execution time | <1 ms (a no-op payload; process spawn dominates) |
+| Single-job latency, idle pool, n=20 | 19-37 ms fastest, 158-211 ms median, 841 ms slowest |
 
-The latency spread is the polling interval, not execution cost: an idle worker
-sleeps 1s ± 25% jitter between claim attempts, so a job arriving just after a
-poll waits out the remainder. Under sustained load workers never idle and the
-throughput figure applies. `LISTEN/NOTIFY` would remove the wait.
+Read them with the caveats:
 
-Throughput here is bounded by Postgres round trips and the 25-connection pool,
-not by the claim query.
+- **Run-to-run variance is real.** The ranges above are three back-to-back runs
+  on an otherwise idle machine; an earlier set taken while the machine was busy
+  measured submit throughput as low as 910 jobs/s. Everything competes for the
+  same 4 CPUs, so this measures this laptop, not Postgres.
+- **End-to-end is measured from the first submit**, so it includes submission,
+  and it is bounded by 5 single-slot workers: each worker runs one job at a time,
+  which is why per-worker concurrency is on the improvement list.
+- **End-to-end throughput needs a large enough `--jobs`.** The first claim can
+  wait out a poll interval, and that fixed cost is amortized over the run: at
+  `--jobs 50` the same stack measures about 100 jobs/s.
+- **The latency spread is the polling interval, not execution cost.** An idle
+  worker sleeps 1s +/- 25% jitter between claim attempts, so a job arriving just
+  after a poll waits out the remainder. Under sustained load workers never idle
+  and the throughput figure applies instead. `LISTEN/NOTIFY` would remove the
+  wait.
+- **Throughput is bounded by Postgres round trips and the 25-connection pool**,
+  not by the claim query.
 
 ## Tests
 
 ```bash
 go test -race ./internal/... ./cmd/...      # no database required
 
-docker compose up -d postgres
+docker compose up -d postgres      # Postgres only -- see the note below
 TEST_DATABASE_URL='postgres://queue:queue@localhost:5433/queue?sslmode=disable' \
   go test -race ./...
 ```
 
-52 tests, ~1,850 lines. The suite in `tests/` exercises the real HTTP API
+> Run the integration tests against Postgres **without** a worker pool attached
+> to the same database (`docker compose stop worker` if the full stack is up).
+> Live workers claim the tests' jobs, which fails any test asserting on queue
+> depth or attempt counts.
+
+57 tests, ~1,950 lines. The suite in `tests/` exercises the real HTTP API
 against real Postgres: 50 goroutines racing for one job, 10 workers over 50
 jobs, lease expiry and reclaim, stale-worker fencing, retry exhaustion,
 idempotent completion, concurrent reapers, and a live three-worker pool. Without
