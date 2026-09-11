@@ -179,8 +179,9 @@ func (b *bench) submitPhase(total, concurrency int) (int, float64, error) {
 }
 
 // drainPhase waits until every submitted job has reached a terminal state, then
-// reports the end-to-end rate (measured from the first submit, so it includes
-// submission) and the median executor runtime the workers reported.
+// reports the pipeline rate and the median executor runtime the workers reported.
+// The clock starts at the caller's start, not here, so submission counts against
+// the rate -- a producer cannot submit and execute at the same time.
 func (b *bench) drainPhase(baseline, submitted int, start time.Time, timeout time.Duration) (float64, int64, error) {
 	fmt.Printf("waiting for %d jobs to finish...\n", submitted)
 	deadline := time.Now().Add(timeout)

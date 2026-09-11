@@ -63,9 +63,13 @@ go build -o queue ./cmd/queue
 ```
 ID:        1
 Status:    COMPLETED
+Type:      shell
+Payload:   echo hello
 Attempts:  1/3
-Worker:    bd648814fbe3-2673f0
-Duration:  10ms
+Worker:    fe49b0e927b7-386994
+Created:   2026-09-11T18:00:01-05:00
+Duration:  4ms
+Exit code: 0
 --- stdout ---
 hello
 ```
@@ -163,19 +167,19 @@ make bench          # go run ./cmd/queue-bench --jobs 300 --concurrency 16
 
 Measured on a MacBook Air (M1, 8 cores) with Docker Desktop allotted 4 CPUs and
 2 GB: Postgres, the server and 5 workers all in containers, 300 no-op jobs
-(`true`). Each figure is the range across 3 consecutive runs.
+(`true`). Each figure is the range across 4 consecutive runs.
 
 | Metric | Result |
 |---|---|
-| Submit throughput (16 connections) | 1,320-1,480 jobs/s |
+| Submit throughput (16 connections) | 1,320-1,570 jobs/s |
 | End-to-end throughput (submit, claim, execute, report) | 315-350 jobs/s |
 | Job execution time | <1 ms (a no-op payload; process spawn dominates) |
 | Single-job latency, idle pool, n=20 | 19-37 ms fastest, 158-211 ms median, 841 ms slowest |
 
 Read them with the caveats:
 
-- **Run-to-run variance is real.** The ranges above are three back-to-back runs
-  on an otherwise idle machine; an earlier set taken while the machine was busy
+- **Run-to-run variance is real.** The ranges above are four runs on an
+  otherwise idle machine; an earlier set taken while the machine was busy
   measured submit throughput as low as 910 jobs/s. Everything competes for the
   same 4 CPUs, so this measures this laptop, not Postgres.
 - **End-to-end is measured from the first submit**, so it includes submission,
