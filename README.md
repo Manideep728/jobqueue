@@ -143,14 +143,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_expired_leases
 Terminal transitions are fenced by `WHERE status = 'RUNNING' AND worker_id = $2`,
 so a worker whose lease lapsed cannot overwrite the result of its replacement.
 
-The concurrency tests were validated by mutation: deleting `FOR UPDATE SKIP
-LOCKED` makes them fail immediately.
-
-```
-job 24 was claimed 4 times by [w0 w1 w5 w3]; want exactly once
-job  4 was claimed 5 times by [w1 w0 w9 w8 w5]; want exactly once
-```
-
 Leases, heartbeats, retry scheduling, the state machine and the full API are in
 [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -211,7 +203,7 @@ TEST_DATABASE_URL='postgres://queue:queue@localhost:5433/queue?sslmode=disable' 
 > Live workers claim the tests' jobs, which fails any test asserting on queue
 > depth or attempt counts.
 
-57 tests, ~1,950 lines. The suite in `tests/` exercises the real HTTP API
+The suite in `tests/` exercises the real HTTP API
 against real Postgres: 50 goroutines racing for one job, 10 workers over 50
 jobs, lease expiry and reclaim, stale-worker fencing, retry exhaustion,
 idempotent completion, concurrent reapers, and a live three-worker pool. Without
