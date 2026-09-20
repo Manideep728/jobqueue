@@ -5,8 +5,10 @@ DB_URL ?= postgres://queue:queue@localhost:5433/queue?sslmode=disable
 SERVER ?= http://localhost:8080
 BENCH_JOBS ?= 300
 BENCH_CONC ?= 16
+BENCH_LEVELS ?= 1,4,16,64
+BENCH_CLAIM_JOBS ?= 3000
 
-.PHONY: build test test-unit test-integration bench up down logs fmt vet clean
+.PHONY: build test test-unit test-integration bench bench-claim up down logs fmt vet clean
 
 ## build: compile all three binaries into ./bin
 build:
@@ -27,10 +29,17 @@ test-integration:
 test:
 	TEST_DATABASE_URL='$(DB_URL)' go test -race -count=1 ./...
 
-## bench: measure throughput and latency against a running stack
+## bench: measure end-to-end throughput and latency against a running stack
 ## (start one first: docker compose up -d --scale worker=5)
 bench:
 	go run ./cmd/queue-bench --server '$(SERVER)' --jobs $(BENCH_JOBS) --concurrency $(BENCH_CONC)
+
+## bench-claim: measure claim throughput vs. concurrent claimers, and check that
+## no job is ever dispatched twice (needs a stack with NO workers running:
+## docker compose up -d --scale worker=0)
+bench-claim:
+	go run ./cmd/queue-bench --server '$(SERVER)' --mode claim \
+		--claim-levels '$(BENCH_LEVELS)' --claim-jobs $(BENCH_CLAIM_JOBS)
 
 ## up: start Postgres, the server and two workers
 up:

@@ -8,10 +8,16 @@
 // worker processes are running. A fixed job count measures exactly that, and
 // b.N's auto-scaling would fight the queue's own pacing.
 //
-// Usage:
+// Two modes, measuring different things:
 //
+//	# end-to-end: submit, claim, fork/exec, report -- needs real workers
 //	docker compose up -d --scale worker=5
 //	go run ./cmd/queue-bench --jobs 300 --concurrency 16
+//
+//	# claim contention: the claim path alone, plus an exactly-once check.
+//	# Needs NO workers, or they would claim the backlog out from under it.
+//	docker compose up -d --scale worker=0
+//	go run ./cmd/queue-bench --mode claim
 //
 // Every number it prints is measured. Nothing is extrapolated.
 package main
@@ -19,6 +25,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -30,23 +37,52 @@ import (
 
 func main() {
 	server := flag.String("server", envOr("QUEUE_SERVER", "http://localhost:8080"), "queue server URL")
+	mode := flag.String("mode", "pipeline", "pipeline (submit to report; needs live workers) or claim (claim contention; needs none)")
 	total := flag.Int("jobs", 300, "jobs to submit for the throughput phase")
 	concurrency := flag.Int("concurrency", 16, "concurrent submit connections")
 	samples := flag.Int("latency-samples", 20, "single jobs to time against an idle pool")
 	payload := flag.String("payload", "true", "job payload; the default is a no-op so the queue is measured, not the work")
 	drainTimeout := flag.Duration("drain-timeout", 2*time.Minute, "give up if the queue has not drained in this long")
+	levels := flag.String("claim-levels", "1,4,16,64", "claim mode: concurrent-claimer counts to measure, comma separated")
+	claimJobs := flag.Int("claim-jobs", 3000, "claim mode: size of the backlog seeded before each level")
 	flag.Parse()
 
-	b := &bench{server: *server, token: os.Getenv("QUEUE_AUTH_TOKEN"), payload: *payload}
-	// One connection per submitter. net/http keeps only 2 idle connections per
-	// host by default, so without this the submit phase would spend its time
-	// opening and closing sockets and understate its own result.
-	b.http = &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{MaxIdleConns: *concurrency * 2, MaxIdleConnsPerHost: *concurrency * 2},
+	var err error
+	var counts []int
+	// The connection pool has to cover the most concurrent callers any phase will
+	// run, which in claim mode is the largest level rather than --concurrency.
+	// Sizing it below that turns the shortfall into TCP setup on every request
+	// and shows up as a dip in the curve that has nothing to do with the queue.
+	peak := *concurrency
+	if *mode == "claim" {
+		if counts, err = parseLevels(*levels); err == nil {
+			for _, c := range counts {
+				if c > peak {
+					peak = c
+				}
+			}
+		}
 	}
 
-	if err := b.run(*total, *concurrency, *samples, *drainTimeout); err != nil {
+	b := &bench{server: *server, token: os.Getenv("QUEUE_AUTH_TOKEN"), payload: *payload}
+	// One connection per caller. net/http keeps only 2 idle connections per host
+	// by default, so without this the bench would spend its time opening and
+	// closing sockets and understate its own result.
+	b.http = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{MaxIdleConns: peak * 2, MaxIdleConnsPerHost: peak * 2},
+	}
+
+	switch {
+	case err != nil: // a --claim-levels parse failure, reported below
+	case *mode == "pipeline":
+		err = b.run(*total, *concurrency, *samples, *drainTimeout)
+	case *mode == "claim":
+		err = b.runClaim(counts, *claimJobs, *concurrency)
+	default:
+		err = fmt.Errorf("unknown --mode %q: want pipeline or claim", *mode)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench: %v\n", err)
 		os.Exit(1)
 	}
@@ -348,6 +384,28 @@ func (b *bench) medianDurationMS(n int) (int64, error) {
 // HTTP
 // ---------------------------------------------------------------------------
 
+// httpError is a non-2xx response. It is a type rather than a formatted string
+// so a caller can branch on the server's error code -- claim mode has to tell
+// "the queue is empty" (404 no_jobs_available, an expected end condition) apart
+// from every other failure, and matching on message text would be brittle.
+type httpError struct {
+	Method string
+	Path   string
+	Status int
+	Code   string
+	Msg    string
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("%s %s: %d %s: %s", e.Method, e.Path, e.Status, e.Code, e.Msg)
+}
+
+// hasCode reports whether err is an httpError carrying the given error code.
+func hasCode(err error, code string) bool {
+	var he *httpError
+	return errors.As(err, &he) && he.Code == code
+}
+
 func (b *bench) get(path string, out any) error        { return b.do("GET", path, nil, out) }
 func (b *bench) post(path string, body, out any) error { return b.do("POST", path, body, out) }
 
@@ -381,7 +439,10 @@ func (b *bench) do(method, path string, body, out any) error {
 			Code  string `json:"code"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return fmt.Errorf("%s %s: %d %s: %s", method, path, resp.StatusCode, e.Code, e.Error)
+		return &httpError{
+			Method: method, Path: path,
+			Status: resp.StatusCode, Code: e.Code, Msg: e.Error,
+		}
 	}
 	if out == nil {
 		return nil
