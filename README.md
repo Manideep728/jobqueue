@@ -148,35 +148,94 @@ Leases, heartbeats, retry scheduling, the state machine and the full API are in
 
 ## Benchmarks
 
-The harness that produced these numbers is in the repo
-([cmd/queue-bench](cmd/queue-bench/main.go)) -- it drives the real stack over
-HTTP and prints the table below:
+The harness is in the repo ([cmd/queue-bench](cmd/queue-bench/main.go)). It
+drives the real stack over HTTP and prints the tables below. It has two modes,
+which measure deliberately different things.
+
+All figures: MacBook Air (M1, 8 cores), Docker Desktop allotted 4 CPUs and 2 GB,
+Postgres and the server in containers, no-op (`true`) payloads.
+
+### Claim contention
+
+The claim is the one operation that has to be fast *and* exactly-once, so it is
+measured on its own. This mode seeds a backlog, then turns N claimers loose on
+`POST /jobs/claim` and times the drain. Nothing executes the jobs, so the rate
+is the claim path and nothing else. No workers may be running, or they would
+claim the backlog out from under the benchmark:
+
+```bash
+docker compose up -d --scale worker=0
+make bench-claim    # go run ./cmd/queue-bench --mode claim
+```
+
+| Concurrent claimers | Claim throughput |
+|---|---|
+| 1 | 507 claims/s |
+| 2 | 793 claims/s |
+| 4 | 1,101 claims/s |
+| 8 | 1,120 claims/s |
+| 16 | 980 claims/s |
+| 32 | 1,164 claims/s |
+| 64 | 1,364 claims/s |
+| 128 | 1,115 claims/s |
+
+Single run, 2,000 jobs per level. Every claimed id is recorded and checked for
+duplicates: across five runs, **no job was ever claimed twice -- 0 duplicates in
+64,000 claims**, at up to 128-way concurrency.
+
+Reading the curve:
+
+- **Throughput roughly doubles from 1 to 4 claimers, then flattens.** Beyond
+  about 4 concurrent claimers, more claimers buy nothing on this hardware.
+- **It does not collapse under heavy contention.** 128 claimers fighting over
+  one queue head sustain the same rate as 8. That is the behavior `SKIP LOCKED`
+  is chosen for -- but this benchmark does not *prove* the attribution, because
+  it measures no baseline. Demonstrating the speedup properly means running a
+  blocking `FOR UPDATE` side by side, which is not done here.
+- **The ceiling is probably not the claim query.** Submits plateau in a similar
+  band (below), and a submit is a plain `INSERT` with no contention at all. Two
+  unrelated operations hitting a similar wall points at per-transaction cost --
+  one Postgres on 4 shared CPUs, one round trip per operation -- rather than
+  anything specific to claiming.
+- **The dip at 16 reproduces across runs** but sits inside the run-to-run spread
+  of its neighbours (at 1/4/16/64 over four runs: 345-440, 741-930, 686-872,
+  884-1,364 claims/s). Treat it as noise, not a feature.
+- The benchmark client is a plausible co-bottleneck: it is another Go process
+  competing for the same 4 CPUs as Postgres and the server.
+
+### End-to-end pipeline
+
+This mode measures the whole path -- submit, claim, fork/exec, report -- with
+real workers running:
 
 ```bash
 docker compose up -d --scale worker=5
 make bench          # go run ./cmd/queue-bench --jobs 300 --concurrency 16
 ```
 
-Measured on a MacBook Air (M1, 8 cores) with Docker Desktop allotted 4 CPUs and
-2 GB: Postgres, the server and 5 workers all in containers, 300 no-op jobs
-(`true`). Each figure is the range across 4 consecutive runs.
+300 jobs, 5 workers. Each figure is the range across 4 consecutive runs.
 
 | Metric | Result |
 |---|---|
-| Submit throughput (16 connections) | 1,320-1,570 jobs/s |
 | End-to-end throughput (submit, claim, execute, report) | 315-350 jobs/s |
 | Job execution time | <1 ms (a no-op payload; process spawn dominates) |
 | Single-job latency, idle pool, n=20 | 19-37 ms fastest, 158-211 ms median, 841 ms slowest |
+| Submit throughput (16 connections) | 1,320-1,570 jobs/s |
 
 Read them with the caveats:
 
+- **Submit throughput is the least interesting number here.** It is one `INSERT`
+  behind one HTTP handler, which is to say it measures Go's `net/http` and
+  Postgres, not this queue. It is listed last on purpose.
 - **Run-to-run variance is real.** The ranges above are four runs on an
   otherwise idle machine; an earlier set taken while the machine was busy
   measured submit throughput as low as 910 jobs/s. Everything competes for the
   same 4 CPUs, so this measures this laptop, not Postgres.
 - **End-to-end is measured from the first submit**, so it includes submission,
   and it is bounded by 5 single-slot workers: each worker runs one job at a time,
-  which is why per-worker concurrency is on the improvement list.
+  which is why per-worker concurrency is on the improvement list. It is a
+  measurement of the worker fleet at least as much as of the queue -- the claim
+  contention numbers above are the ones that describe the queue itself.
 - **End-to-end throughput needs a large enough `--jobs`.** The first claim can
   wait out a poll interval, and that fixed cost is amortized over the run: at
   `--jobs 50` the same stack measures about 100 jobs/s.
@@ -185,8 +244,6 @@ Read them with the caveats:
   after a poll waits out the remainder. Under sustained load workers never idle
   and the throughput figure applies instead. `LISTEN/NOTIFY` would remove the
   wait.
-- **Throughput is bounded by Postgres round trips and the 25-connection pool**,
-  not by the claim query.
 
 ## Tests
 
